@@ -6,6 +6,7 @@ use ndarray::prelude::*;
 use ndarray_rand::{RandomExt};
 use ndarray_rand::rand_distr::Uniform;
 
+use rand::seq::SliceRandom;
 // CLI
 use serde::{Serialize, Deserialize};
 use clap::{Parser, Subcommand};
@@ -43,7 +44,7 @@ fn print_data(image_num: usize, data: &Array3<f32>, labels: &Array2<f32>){
     }
 }
 
-fn load_mnist () -> (ArrayBase<ndarray::OwnedRepr<f32>, Dim<[usize; 3]>>, Array2<f32>, ArrayBase<ndarray::OwnedRepr<f32>, Dim<[usize; 3]>>, Array2<f32>) {
+fn load_mnist () -> (Array3<f32>, Array2<f32>, Array3<f32>, Array2<f32>) {
     let Mnist {
         trn_img,
         trn_lbl,
@@ -61,7 +62,7 @@ fn load_mnist () -> (ArrayBase<ndarray::OwnedRepr<f32>, Dim<[usize; 3]>>, Array2
     // Can use an Array2 or Array3 here (Array3 for visualization)
     let train_data: ArrayBase<ndarray::OwnedRepr<f32>, Dim<[usize; 3]>, f32> = Array3::from_shape_vec((50_000, 28, 28), trn_img)
         .expect("Error converting images to Array3 struct")
-        .map(|x| *x as f32 / 256.0);
+        .map(|x| *x as f32 / 255.0);
     println!("{:#.1?}\n",train_data.slice(s![image_num, .., ..]));
 
     // Convert the returned Mnist struct to Array2 format
@@ -72,7 +73,7 @@ fn load_mnist () -> (ArrayBase<ndarray::OwnedRepr<f32>, Dim<[usize; 3]>>, Array2
 
     let test_data = Array3::from_shape_vec((10_000, 28, 28), tst_img)
         .expect("Error converting images to Array3 struct")
-        .map(|x| *x as f32 / 256.);
+        .map(|x| *x as f32 / 255.0);
 
     let test_labels: Array2<f32> = Array2::from_shape_vec((10_000, 1), tst_lbl)
         .expect("Error converting testing labels to Array2 struct")
@@ -81,11 +82,15 @@ fn load_mnist () -> (ArrayBase<ndarray::OwnedRepr<f32>, Dim<[usize; 3]>>, Array2
     (train_data, train_labels, test_data, test_labels)
 }
 
-fn sigmoid_function(value: f32) -> f32 {
+fn _sigmoid_function(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }
 
-fn _lable_to_array(lable: f32) -> Array1<f32>{
+fn relu_function(value: f32) -> f32 {
+    f32::max(0.0, value)
+}
+
+fn lable_to_array(lable: f32) -> Array1<f32>{
     let mut array = Array1::zeros(10);
     array[lable as usize] = 1.0;
     array
@@ -229,6 +234,12 @@ enum Commands {
 
 // region: Machine Learning functions
 
+#[derive(Debug, Clone)]
+struct LayerGradient {
+    pub weight_gradient: Array2<f32>, 
+    pub bias_gradient: Array1<f32>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct NerualNetwork{
     path: PathBuf,
@@ -237,6 +248,7 @@ struct NerualNetwork{
 } 
 
 impl NerualNetwork {
+    // region: Basic functions
     fn new(path: PathBuf, layer_data: Vec<usize>) -> NerualNetwork{
         let mut nodes: Vec<usize> = vec![784];
         nodes.append(&mut layer_data.clone());
@@ -274,7 +286,10 @@ impl NerualNetwork {
         Ok(network)
     }
 
-    fn train (&mut self, data: &ArrayBase<ndarray::OwnedRepr<f32>, Dim<[usize; 3]>>, labels: &Array2<f32>, epocs: usize, offspring_count: usize) -> Result<(), Box<dyn std::error::Error>> {
+    // endregion
+
+    // region: ML evolution training
+    fn train_evolution (&mut self, data: &Array3<f32>, labels: &Array2<f32>, epocs: usize, offspring_count: usize) -> Result<(), Box<dyn std::error::Error>> {
         let data_length = data.len_of(Axis(0));
         let labels_length = labels.len();
         
@@ -379,11 +394,11 @@ impl NerualNetwork {
         let first_layer = &hidden_layers[0];
 
         let mut current_node_value: Array1<f32> = first_layer.weights.dot(&in_data) + &first_layer.bias;
-        current_node_value.mapv_inplace(|value| sigmoid_function(value));
+        current_node_value.mapv_inplace(|value| relu_function(value));
 
         for layer in &hidden_layers[1..]{
             current_node_value = layer.weights.dot(&current_node_value) + &layer.bias;
-            current_node_value.mapv_inplace(|value| sigmoid_function(value));
+            current_node_value.mapv_inplace(|value| relu_function(value));
         }
 
         current_node_value = output_layer.weights.dot(&current_node_value) + &output_layer.bias;
@@ -395,6 +410,167 @@ impl NerualNetwork {
         cost
     }
 
+    // endregion
+
+    // region: Gradient descent 
+
+    fn train_gradient_descent (&mut self, data: &Array3<f32>, labels: &Array2<f32>, epocs: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let data_length = data.len_of(Axis(0));
+        let labels_length = labels.len();
+        let initial_learning_rate = 0.1;
+        
+        if data_length != labels_length{
+            return Err(Box::new(Error::new(
+                ErrorKind::QuotaExceeded, 
+                format!("Training data and training labels are out of sync, sizes are not the same: {} - {}", data_length, labels_length)
+            )));
+        }
+
+        let batch_size = 200;
+        let mut rng = rand::rng();
+
+        for current_epoc in 0..epocs{
+
+            let mut indexes: Vec<usize> = (0..data_length).collect();
+            indexes.shuffle(&mut rng);
+
+            for index_batch in indexes.chunks(batch_size){
+                let mut batch_gradients: Vec<Vec<LayerGradient>> = index_batch.par_iter().map(|&index| {
+                    let training_image = data.index_axis(Axis(0), index);
+                    let expected_value = labels[[index, 0]];
+
+                    let activations = self.forward_propagate(training_image.flatten().view());
+
+                    let gradiants = self.backwards_propagate(activations, expected_value);
+                    gradiants
+                }).collect();
+
+                let (first_batch, rest) = batch_gradients.split_first_mut().unwrap(); 
+                for batch in rest{
+                    for (index, gradient) in batch.iter().enumerate(){
+                        first_batch[index].weight_gradient += &gradient.weight_gradient;
+                        first_batch[index].bias_gradient += &gradient.bias_gradient;
+                    }
+                }
+
+                for element in first_batch.iter_mut(){
+                    element.weight_gradient /= batch_size as f32;
+                    element.bias_gradient /= batch_size as f32;
+                };
+
+                let learing_rate = initial_learning_rate / f32::max(1.0, self.iteration as f32 * 0.001);
+
+                for (index, layer) in self.layers.iter_mut().enumerate(){
+                    let layer_gradient = &first_batch[index];
+
+                    let weight_step = &layer_gradient.weight_gradient * learing_rate;
+                    let bias_step = &layer_gradient.bias_gradient * learing_rate;
+
+                    layer.weights -= &weight_step;
+                    layer.bias -= &bias_step;
+                } 
+
+                self.iteration += 1;
+            }
+
+
+            if current_epoc % 2 == 0{
+                println!("Progress: {} -- {}", current_epoc, epocs);
+            }
+        }
+        
+        Ok(())
+    }
+
+
+    fn forward_propagate(&self, in_data: ArrayView1<f32>) -> Vec<Array1<f32>>{
+        let mut activations: Vec<Array1<f32>> = Vec::new();
+        activations.push(in_data.to_owned());
+
+        let (output_layer, hidden_layers) = self.layers.split_last().unwrap();
+
+        if hidden_layers.is_empty(){
+            let current_node_value = output_layer.weights.dot(&in_data) + &output_layer.bias;
+            let result = softmax(current_node_value);
+
+            activations.push(result);
+
+            return activations;
+        }
+
+        let first_layer = &hidden_layers[0];
+
+        let mut current_node_value: Array1<f32> = first_layer.weights.dot(&in_data) + &first_layer.bias;
+        current_node_value.mapv_inplace(|value| relu_function(value));
+
+        activations.push(current_node_value.clone());
+
+        for layer in &hidden_layers[1..]{
+            current_node_value = layer.weights.dot(&current_node_value) + &layer.bias;
+            current_node_value.mapv_inplace(|value| relu_function(value));
+
+            activations.push(current_node_value.clone());
+        }
+
+        current_node_value = output_layer.weights.dot(&current_node_value) + &output_layer.bias;
+
+        let result = softmax(current_node_value);
+
+        activations.push(result);
+
+        activations
+    }
+
+    fn backwards_propagate(&self, activations: Vec<Array1<f32>>, expected_value: f32) -> Vec<LayerGradient>{
+        let mut layer_gradiant: Vec<LayerGradient> = vec![];
+        
+        let (last_activation, rest_activations) = activations.split_last().unwrap();
+        let output_error = last_activation - lable_to_array(expected_value);
+    
+        let previous_activation = rest_activations.last().unwrap();
+
+        let output_gradient_weight = output_error
+            .view()
+            .insert_axis(Axis(1))
+            .dot(&previous_activation.view().insert_axis(Axis(0)));
+
+        let output_gradient_bias = output_error.clone();
+        layer_gradiant.push(LayerGradient { weight_gradient: output_gradient_weight, bias_gradient: output_gradient_bias });
+    
+        let mut next_error = output_error;
+        let (output_layer, hidden_layers) = self.layers.split_last().unwrap();
+        let mut next_weights = &output_layer.weights;
+        
+        for i in (0..hidden_layers.len()).rev(){
+            let weight_error = next_weights.t().dot(&next_error);
+            let relu_derivative = rest_activations[i + 1]
+                .map(|&element| if element > 0.0 { 1.0 } else { 0.0 });
+
+            let current_error = weight_error * relu_derivative;
+
+            let current_gradient_weight = current_error
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&rest_activations[i].view().insert_axis(Axis(0)));
+
+            let current_gradient_bias = current_error.clone();
+
+            layer_gradiant.push(LayerGradient {
+                weight_gradient: current_gradient_weight,
+                bias_gradient: current_gradient_bias,
+            });
+
+            next_error = current_error;
+            next_weights = &hidden_layers[i].weights;
+        }   
+
+        layer_gradiant.reverse();
+        layer_gradiant
+    }
+
+    // endregion
+
+    // region: Accuracy testing
     fn predict_data_set(&self, data: &Array3<f32>, labels: &Array2<f32>) {
         let data_length = data.len_of(Axis(0));
         let mut correct_guesses = 0;
@@ -452,17 +628,19 @@ impl NerualNetwork {
         let first_layer = &hidden_layers[0];
 
         let mut current_node_value: Array1<f32> = first_layer.weights.dot(&image) + &first_layer.bias;
-        current_node_value.mapv_inplace(|value| sigmoid_function(value));
+        current_node_value.mapv_inplace(|value| relu_function(value));
 
         for layer in &hidden_layers[1..]{
             current_node_value = layer.weights.dot(&current_node_value) + &layer.bias;
-            current_node_value.mapv_inplace(|value| sigmoid_function(value));
+            current_node_value.mapv_inplace(|value| relu_function(value));
         }
 
         current_node_value = output_layer.weights.dot(&current_node_value) + &output_layer.bias;
 
         get_highest_value_array(&current_node_value).1
     }
+
+    // endregion
 }
 
 
@@ -476,12 +654,14 @@ struct Layer {
 
 impl Layer {
     fn new(from_amount: usize, node_amount: usize) -> Layer{
+        let limit = (6.0 / (from_amount as f32)).sqrt();
+
         Layer { 
             from_amount, 
             node_amount, 
             weights: Array::random(
                 (node_amount, from_amount), 
-                Uniform::new(-1.0 as f32, 1.0 as f32).unwrap()
+                Uniform::new(-limit as f32, limit as f32).unwrap()
             ),
             bias: Array1::zeros(node_amount),
         }
@@ -525,14 +705,14 @@ fn ml_function_loop (brain: &mut NerualNetwork) {
                             continue;
                         }
                     },
-                    None => 500,
+                    None => 10,
                 };
 
                 match command {
-                    "train" => {
+                    "train-evo" => {
                         let start = Instant::now();
 
-                        match brain.train(&train_data, &train_labels, input, 100) {
+                        match brain.train_evolution(&train_data, &train_labels, input, 100) {
                             Ok(_) => {},
                             Err(e) => {eprintln!("Error: training failed, reason '{}'", e)},
                         }
@@ -540,9 +720,35 @@ fn ml_function_loop (brain: &mut NerualNetwork) {
                         let duration = start.elapsed();
                         println!("Training took: '{:?}', did '{}' epocs", duration, input)
                     },
+                    "train-gra" => {
+                        let start = Instant::now();  
+
+                        match brain.train_gradient_descent(&train_data, &train_labels, input) {
+                            Ok(_) => {},
+                            Err(e) => {eprintln!("Error: training failed, reason '{}'", e)},
+                        }
+
+                        let duration = start.elapsed();
+                        println!("Training took: '{:?}', did '{}' epocs", duration, input)
+                    }
                     "repeat" => {
                         loop {
-                            match brain.train(&train_data, &train_labels, 1000, 100) {
+                            match brain.train_evolution(&train_data, &train_labels, 1000, 100) {
+                                Ok(_) => {},
+                                Err(e) => {eprintln!("Error: training failed, reason '{}'", e)},
+                            }    
+
+                            brain.predict_data_set(&test_data, &test_labels);
+
+                            match brain.save() {
+                                Ok(_) => {},
+                                Err(e) => {eprintln!("Error: saving failed, reason '{}'", e)},
+                            }                  
+                        }
+                    },
+                    "repeat-gra" => {
+                        loop {
+                            match brain.train_gradient_descent(&train_data, &train_labels, 10) {
                                 Ok(_) => {},
                                 Err(e) => {eprintln!("Error: training failed, reason '{}'", e)},
                             }    
